@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "会话重命名",
+    "description": "提供 rename_session 工具，让 agent 能给会话起有意义的标题，包括 fork 后留下的 (1) 后缀。"
+  }
+}

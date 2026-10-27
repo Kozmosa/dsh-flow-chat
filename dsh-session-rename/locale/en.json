@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Rename",
+    "description": "Adds a rename_session tool so agents can give a Session a meaningful title, including after a fork leaves an unclear (1) suffix."
+  }
+}

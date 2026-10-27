@@ -1,0 +1,8 @@
+{
+  "meta": {
+    "title": "Session Map",
+    "description": "Draws every Session as a mind map: forks, delegated subagents, and the blind ends you can revisit."
+  },
+  "panel": "Session map",
+  "title": "Branching map"
+}

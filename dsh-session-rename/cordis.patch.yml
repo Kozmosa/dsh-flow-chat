@@ -1,0 +1,3 @@
+- insert:
+    - id: session-rename
+      name: '@local/dsh-session-rename'
