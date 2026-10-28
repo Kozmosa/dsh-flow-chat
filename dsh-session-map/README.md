@@ -12,6 +12,14 @@ lineage is edges, and every leaf is a **blind end** you can revisit.
   the map.
 - Solid edges for `fork` lineage (`parentSession`) and dashed edges for
   delegation (`origin: 'subagent'`).
+- **Subagent batches group.** Delegated children of one parent whose catalog
+  `childCreatedAt` instants fall within 60 seconds share a dashed group box
+  ("N subagents · when") with a faint tinted background. Batches start
+  collapsed to a single "N subagent calls" block; the block expands to the
+  full box, or folds entirely into the parent, which then carries a
+  `subagents × N` badge — un-folding from that badge returns to the block
+  first. Collapse choices are remembered for the page session (tab switches
+  keep them; a reload or app restart starts fresh).
 - **Any node can start a branch.** Every node carries a `+` control in its
   top-right corner (bright on hover or focus) that opens its branch menu: open
   the Session, or **Fork from tail** (`fork()`, the same call the turn-tail
@@ -26,6 +34,14 @@ lineage is edges, and every leaf is a **blind end** you can revisit.
 - Canvas: drag to pan, wheel to zoom, drag a node to nudge it, minimap with a
   viewport rectangle, double-click empty space to start a Session in that
   Workspace's band, filter field, fit-to-view, and an optional archived view.
+- **Workspace filter.** A hamburger toggle at the toolbar's right edge opens a
+  right side panel that picks which Workspace bands render; the newest
+  Workspace is selected by default. Like batch collapse, the choice lives in
+  page-session memory: tab switches keep it, a reload or app restart starts
+  fresh.
+- Searching temporarily expands batches that contain matches, so a hit inside
+  a collapsed block becomes visible; matches outside the selected Workspaces
+  are ignored.
 - Locale-aware copy (English and Simplified Chinese) and theme-token-only
   styling.
 
@@ -79,9 +95,12 @@ up a changed `client.js`.
   pixels so glyphs do not sit on half pixels.
 - Canvas drags disable text selection (`user-select: none`) so panning never
   starts a selection in the node labels.
+- Workspace band height follows the visible content: collapsed subagent
+  batches (and their descendants) neither render nor reserve vertical space.
 
 ## Tests
 
 `node test/graph.test.mjs` exercises the pure graph model and layout: lineage
 edges, leaf classification, archived filtering, cycle degradation, workspace
-inheritance, band stacking, node overlap, and locale key parity.
+inheritance, band stacking, node overlap, subagent batching with both collapse
+levels, and locale key parity.

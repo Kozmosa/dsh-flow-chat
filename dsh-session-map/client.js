@@ -36,6 +36,23 @@ window.__ModuleLoader__.load({
 		const MAX_SCALE = 2;
 		const MINIMAP_W = 178;
 		const MINIMAP_H = 114;
+		// Subagent batches: one parent's delegated children whose catalog
+		// childCreatedAt entries fall within this window were triggered
+		// together (one parallel fan-out) and share a group box.
+		const SUBAGENT_BATCH_GAP_MS = 60_000;
+		const GROUP_PAD_X = 14;
+		const GROUP_HEADER = 30;
+		const GROUP_PAD_TOP = 12;
+		const GROUP_PAD_BOTTOM = 14;
+		// A batch that has never been touched renders as one block, not as a
+		// wall of member nodes.
+		const DEFAULT_GROUP_MODE = 1;
+		// Page-session memory for batch collapse choices: survives switching
+		// away from the map panel, cleared by a page reload.
+		let groupCollapseMemory = {};
+		// Same page-session memory for the workspace filter (null = untouched,
+		// follow the newest workspace).
+		let workspaceFilterMemory = null;
 
 		const zh = {
 			panel: '会话地图',
@@ -49,6 +66,11 @@ window.__ModuleLoader__.load({
 			'toolbar.archived': '显示已归档',
 			'toolbar.hideArchived': '隐藏已归档',
 			'toolbar.new': '新建会话',
+			'filter.toggle': '工作区筛选',
+			'filter.title': '显示的工作区',
+			'filter.selectAll': '全选 / 仅最新',
+			'filter.none': '没有选中的工作区，点右上角菜单选择。',
+			'filter.count': '{n}',
 			'legend.label': '图例',
 			'legend.fork': '分支',
 			'legend.subagent': '委托',
@@ -65,6 +87,13 @@ window.__ModuleLoader__.load({
 			'node.open': '打开会话',
 			'node.actions': '分支操作',
 			'node.branch': '从此处分叉',
+			'group.label': '{n} 个子代理',
+			'group.block': '{n} 次子代理调用',
+			'group.collapse': '折叠为一格',
+			'group.expand': '展开这组子代理',
+			'group.fold': '整组折叠进父会话',
+			'group.expandParent': '展开折叠的子代理',
+			'group.foldedBadge': '子代理 ×{n}',
 			'open.archived': '已归档的会话无法直接打开，请先在侧栏恢复归档。',
 			'menu.heading': '从这里分叉',
 			'menu.continue': '继续此会话',
@@ -116,6 +145,11 @@ window.__ModuleLoader__.load({
 			'toolbar.archived': 'Show archived',
 			'toolbar.hideArchived': 'Hide archived',
 			'toolbar.new': 'New session',
+			'filter.toggle': 'Workspace filter',
+			'filter.title': 'Workspaces to show',
+			'filter.selectAll': 'All / latest only',
+			'filter.none': 'No workspace selected — pick one from the menu at the top right.',
+			'filter.count': '{n}',
 			'legend.label': 'Legend',
 			'legend.fork': 'Fork',
 			'legend.subagent': 'Delegation',
@@ -132,6 +166,13 @@ window.__ModuleLoader__.load({
 			'node.open': 'Open session',
 			'node.actions': 'Branch actions',
 			'node.branch': 'Branch from here',
+			'group.label': '{n} subagents',
+			'group.block': '{n} subagent calls',
+			'group.collapse': 'Collapse to one block',
+			'group.expand': 'Expand this batch',
+			'group.fold': 'Fold the whole batch into the parent Session',
+			'group.expandParent': 'Expand folded subagents',
+			'group.foldedBadge': 'subagents ×{n}',
 			'open.archived': 'This session is archived. Unarchive it from the sidebar first.',
 			'menu.heading': 'Branch from here',
 			'menu.continue': 'Continue this session',
@@ -180,8 +221,9 @@ window.__ModuleLoader__.load({
 		 * @param sessions - the Client session store snapshot `{ids, byId}`.
 		 * @param workspaces - the workspace store snapshot `{items, archivedSessionIds}`.
 		 * @param showArchived - whether archived sessions stay on the map.
+		 * @param visibleIds - visible workspace ids (Set); null/undefined shows all.
 		 */
-		function buildGraph(sessions, workspaces, showArchived) {
+		function buildGraph(sessions, workspaces, showArchived, visibleIds) {
 			const byId = (sessions && sessions.byId) || {};
 			const ids = (sessions && sessions.ids) || [];
 			const items = (workspaces && workspaces.items) || [];
@@ -291,26 +333,91 @@ window.__ModuleLoader__.load({
 				if (node.leaf) leafCount += 1;
 				if (node.running) runningCount += 1;
 			}
-			const orderedGroups = [];
+			// Subagent batches: cluster each parent's delegated children by the
+			// creation instants the parent's subagentCatalog publishes, so a
+			// parallel fan-out becomes one group box instead of loose siblings.
+			const subagentGroups = [];
+			for (const node of nodes.values()) {
+				const catalog = subagentCatalogOf(node.row);
+				if (catalog === undefined) continue;
+				const createdAt = new Map();
+				for (const entry of catalog) {
+					if (entry === null || typeof entry !== 'object') continue;
+					// Cached checkpoints serialize {childId, childCreatedAt};
+					// the live projection view publishes {id, createdAt}.
+					// Accept both so an open parent groups the same way.
+					const childId = entry.childId ?? entry.id;
+					const at = entry.childCreatedAt ?? entry.createdAt;
+					if (typeof childId === 'string' && typeof at === 'number') createdAt.set(childId, at);
+				}
+				if (createdAt.size < 2) continue;
+				const timed = [];
+				for (const child of node.children) {
+					if (child.origin !== 'subagent') continue;
+					const at = createdAt.get(child.id) ?? createdAt.get(String(child.id).replace(/^session-/, ''));
+					if (at === undefined) continue;
+					timed.push({ child, at });
+				}
+				timed.sort((left, right) => left.at - right.at || String(left.child.id).localeCompare(String(right.child.id)));
+				const emit = (batch) => {
+					if (batch.length < 2) return;
+					// Only group when every member stays in the parent's band.
+					if (batch.some((entry) => entry.child.workspaceId !== node.workspaceId)) return;
+					const group = {
+						key: `sg:${node.id}:${batch[0].at}`,
+						parentId: node.id,
+						startedAt: batch[0].at,
+						members: batch.map((entry) => entry.child),
+					};
+					for (const member of group.members) member.groupKey = group.key;
+					subagentGroups.push(group);
+				};
+				let batch = [];
+				for (const entry of timed) {
+					if (batch.length === 0 || entry.at - batch[batch.length - 1].at <= SUBAGENT_BATCH_GAP_MS) batch.push(entry);
+					else {
+						emit(batch);
+						batch = [entry];
+					}
+				}
+				emit(batch);
+			}
+			const allGroups = [];
 			for (const workspace of items) {
 				const group = groups.get(workspace.workspaceId);
-				if (group !== undefined && group.nodes.length > 0) orderedGroups.push(group);
+				if (group !== undefined && group.nodes.length > 0) allGroups.push(group);
 			}
 			const ungrouped = groups.get(UNGROUPED);
-			if (ungrouped !== undefined && ungrouped.nodes.length > 0) orderedGroups.push(ungrouped);
+			if (ungrouped !== undefined && ungrouped.nodes.length > 0) allGroups.push(ungrouped);
+			// A workspace filter keeps whole bands off the canvas; counts and
+			// search follow the visible bands only.
+			const visibleAll = visibleIds === undefined || visibleIds === null;
+			const orderedGroups = visibleAll ? allGroups : allGroups.filter((group) => visibleIds.has(group.workspaceId));
+			let total = 0;
+			leafCount = 0;
+			runningCount = 0;
+			for (const group of orderedGroups) {
+				for (const node of group.nodes) {
+					total += 1;
+					if (node.leaf) leafCount += 1;
+					if (node.running) runningCount += 1;
+				}
+			}
 			return {
 				groups: orderedGroups,
+				allGroups,
 				nodes,
-				total: nodes.size,
+				subagentGroups,
+				total,
 				leafCount,
 				runningCount,
 			};
 		}
 
-		/** Lay one group's forest out left-to-right; returns world positions + extents. */
-		function layoutForest(group, nodes) {
-			const childrenOf = new Map();
+		/** Lay one band's forest out left-to-right, honoring subagent group collapse. */
+		function layoutForest(group, nodes, subagentGroups, groupState) {
 			const memberIds = new Set(group.nodes.map((node) => node.id));
+			const childrenOf = new Map();
 			for (const node of group.nodes) {
 				if (node.parentId !== undefined && memberIds.has(node.parentId)) {
 					const list = childrenOf.get(node.parentId) || [];
@@ -318,49 +425,146 @@ window.__ModuleLoader__.load({
 					childrenOf.set(node.parentId, list);
 				}
 			}
-			let cursor = 0;
+			const groupsByParent = new Map();
+			for (const subGroup of subagentGroups || []) {
+				if (!memberIds.has(subGroup.parentId)) continue;
+				const list = groupsByParent.get(subGroup.parentId) || [];
+				list.push(subGroup);
+				groupsByParent.set(subGroup.parentId, list);
+			}
+			const stateOf = (subGroup) => (groupState && groupState[subGroup.key]) ?? DEFAULT_GROUP_MODE;
+			const grouped = new Set();
+			for (const list of groupsByParent.values()) {
+				for (const subGroup of list) for (const member of subGroup.members) grouped.add(member.id);
+			}
+			// A collapsed batch hides its members AND their descendants: the
+			// fallback root pass must not lay them out (that used to inflate
+			// the band to its fully-expanded height) and nested children must
+			// not leak out as orphan roots.
+			const hidden = new Set();
+			const hideWithDescendants = (node) => {
+				if (hidden.has(node.id)) return;
+				hidden.add(node.id);
+				for (const child of childrenOf.get(node.id) || []) hideWithDescendants(child);
+			};
+			for (const list of groupsByParent.values()) {
+				for (const subGroup of list) {
+					if (stateOf(subGroup) !== 0) for (const member of subGroup.members) hideWithDescendants(member);
+				}
+			}
+			// A parent's lane is a sequence of units: a lone child node, or a
+			// subagent batch that renders as one group box / block / nothing.
+			const unitTime = (unit) => unit.kind === 'group' ? unit.group.startedAt : unit.node.updatedAt;
+			const unitsOf = (node) => {
+				const units = [];
+				for (const subGroup of groupsByParent.get(node.id) || []) units.push({ kind: 'group', group: subGroup });
+				for (const child of childrenOf.get(node.id) || []) if (!grouped.has(child.id)) units.push({ kind: 'node', node: child });
+				units.sort((left, right) => unitTime(left) - unitTime(right));
+				return units;
+			};
+			let yCursor = 0;
 			const positions = new Map();
+			const boxes = [];
 			const visiting = new Set();
 			const walk = (node, depth) => {
 				if (visiting.has(node.id)) return null;
 				visiting.add(node.id);
-				const children = (childrenOf.get(node.id) || []).filter((child) => !visiting.has(child.id));
-				let y;
-				if (children.length === 0) {
-					y = cursor * (NODE_H + V_GAP);
-					cursor += 1;
-				} else {
-					const rows = [];
-					for (const child of children) {
-						const childY = walk(child, depth + 1);
-						if (childY !== null) rows.push(childY);
+				const units = unitsOf(node).filter((unit) => unit.kind !== 'group' || stateOf(unit.group) !== 2);
+				let top = null;
+				let bottom = null;
+				for (const unit of units) {
+					let unitTop = null;
+					let unitBottom = null;
+					if (unit.kind === 'node') {
+						const childY = walk(unit.node, depth + 1);
+						if (childY === null) continue;
+						unitTop = childY;
+						unitBottom = childY + NODE_H;
+					} else if (stateOf(unit.group) === 1) {
+						// Level-1 collapse: the whole batch is one block.
+						unitTop = yCursor;
+						unitBottom = unitTop + NODE_H;
+						yCursor += NODE_H + V_GAP;
+						boxes.push({ group: unit.group, mode: 'block', x: (depth + 1) * (NODE_W + H_GAP), y: unitTop, width: NODE_W, height: NODE_H });
+					} else {
+						// Expanded: reserve a header row, then stack the members.
+						const boxTop = yCursor;
+						yCursor += GROUP_HEADER + GROUP_PAD_TOP;
+						let firstTop = null;
+						let lastBottom = null;
+						for (const member of unit.group.members) {
+							if (visiting.has(member.id)) continue;
+							const memberY = walk(member, depth + 1);
+							if (memberY === null) continue;
+							if (firstTop === null) firstTop = memberY;
+							lastBottom = memberY + NODE_H;
+						}
+						if (firstTop === null) {
+							yCursor -= GROUP_HEADER + GROUP_PAD_TOP;
+							continue;
+						}
+						const boxBottom = lastBottom + GROUP_PAD_BOTTOM;
+						yCursor = Math.max(yCursor, boxBottom + V_GAP);
+						boxes.push({
+							group: unit.group,
+							mode: 'expanded',
+							x: (depth + 1) * (NODE_W + H_GAP) - GROUP_PAD_X,
+							y: boxTop,
+							width: NODE_W + GROUP_PAD_X * 2,
+							height: boxBottom - boxTop,
+						});
+						unitTop = boxTop;
+						unitBottom = boxBottom;
 					}
-					y = rows.length === 0 ? cursor * (NODE_H + V_GAP) : (rows[0] + rows[rows.length - 1]) / 2;
-					if (rows.length === 0) cursor += 1;
+					if (unitTop !== null && (top === null || unitTop < top)) top = unitTop;
+					if (unitBottom !== null && (bottom === null || unitBottom > bottom)) bottom = unitBottom;
+				}
+				let y;
+				if (top === null) {
+					y = yCursor;
+					yCursor += NODE_H + V_GAP;
+				} else {
+					y = (top + bottom) / 2 - NODE_H / 2;
 				}
 				visiting.delete(node.id);
 				positions.set(node.id, { x: depth * (NODE_W + H_GAP), y });
 				return y;
 			};
 			const roots = group.roots.length > 0 ? group.roots : group.nodes.filter((node) => node.parentId === undefined);
-			for (const root of roots) walk(root, 0);
-			for (const node of group.nodes) if (!positions.has(node.id)) walk(node, 0);
+			for (const root of roots) if (!hidden.has(root.id)) walk(root, 0);
+			for (const node of group.nodes) if (!positions.has(node.id) && !hidden.has(node.id)) walk(node, 0);
 			let maxX = 0;
 			let maxY = 0;
 			for (const position of positions.values()) {
 				maxX = Math.max(maxX, position.x + NODE_W);
 				maxY = Math.max(maxY, position.y + NODE_H);
 			}
-			return { positions, width: maxX, height: maxY };
+			for (const box of boxes) {
+				maxX = Math.max(maxX, box.x + box.width);
+				maxY = Math.max(maxY, box.y + box.height);
+			}
+			return { positions, boxes, width: maxX, height: maxY };
 		}
 
 		/** Stack workspace bands and translate local forest positions into world space. */
-		function layoutGraph(graph) {
+		function layoutGraph(graph, groupState) {
+			const stateOf = (subGroup) => (groupState && groupState[subGroup.key]) ?? DEFAULT_GROUP_MODE;
+			// Collapsed batches leave the canvas together with descendants.
+			const hiddenMembers = new Set();
+			const hideWithDescendants = (node) => {
+				if (hiddenMembers.has(node.id)) return;
+				hiddenMembers.add(node.id);
+				for (const child of node.children) hideWithDescendants(child);
+			};
+			for (const subGroup of graph.subagentGroups) {
+				if (stateOf(subGroup) !== 0) for (const member of subGroup.members) hideWithDescendants(member);
+			}
 			const bands = [];
 			const placed = [];
+			const groupBoxes = [];
 			let cursorY = 0;
 			for (const group of graph.groups) {
-				const forest = layoutForest(group, graph.nodes);
+				const forest = layoutForest(group, graph.nodes, graph.subagentGroups, groupState);
 				const contentWidth = Math.max(forest.width, 300);
 				const contentHeight = Math.max(forest.height, NODE_H);
 				const band = {
@@ -373,6 +577,7 @@ window.__ModuleLoader__.load({
 				};
 				bands.push(band);
 				for (const node of group.nodes) {
+					if (hiddenMembers.has(node.id)) continue;
 					const local = forest.positions.get(node.id);
 					if (local === undefined) continue;
 					placed.push({
@@ -381,11 +586,14 @@ window.__ModuleLoader__.load({
 						y: cursorY + BAND_HEADER + BAND_PAD + local.y,
 					});
 				}
+				for (const box of forest.boxes) {
+					groupBoxes.push({ ...box, x: BAND_PAD + box.x, y: cursorY + BAND_HEADER + BAND_PAD + box.y });
+				}
 				cursorY += band.height + BAND_GAP;
 			}
 			const width = bands.reduce((max, band) => Math.max(max, band.width), 0);
 			const height = bands.length === 0 ? 0 : bands[bands.length - 1].y + bands[bands.length - 1].height;
-			return { bands, placed, bounds: { width, height } };
+			return { bands, placed, groupBoxes, bounds: { width, height } };
 		}
 
 		// ------------------------------------------------------------------
@@ -407,6 +615,16 @@ window.__ModuleLoader__.load({
 			const days = Math.floor(hours / 24);
 			if (days < 30) return t('time.days', { n: days });
 			return t('time.months', { n: Math.floor(days / 30) });
+		}
+
+		/** The parent's delegated-child catalog (childId + creation instant), when published. */
+		function subagentCatalogOf(row) {
+			const values = row && row.projectionValues;
+			const catalog = values && values.subagentCatalog;
+			if (Array.isArray(catalog)) return catalog;
+			const head = catalog && catalog.head;
+			if (head && Array.isArray(head.values)) return head.values;
+			return undefined;
 		}
 
 		function firstPromptOf(row) {
@@ -480,6 +698,32 @@ window.__ModuleLoader__.load({
 				h('path', { d: 'M3 2.6v4h4' }));
 		}
 
+		function IconAgents({ size = 13 }) {
+			return h('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.4, strokeLinecap: 'round', 'aria-hidden': true },
+				h('circle', { cx: 4, cy: 8, r: 2 }),
+				h('circle', { cx: 11.6, cy: 4.4, r: 2 }),
+				h('circle', { cx: 11.6, cy: 11.6, r: 2 }),
+				h('path', { d: 'M5.9 7.2 9.7 5.2' }),
+				h('path', { d: 'M5.9 8.8 9.7 10.8' }));
+		}
+
+		function IconFold({ size = 12 }) {
+			return h('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+				h('path', { d: 'M2.5 8h7.5' }),
+				h('path', { d: 'M7.5 5.2 10.3 8 7.5 10.8' }),
+				h('path', { d: 'M13.2 4.6v6.8' }));
+		}
+
+		function IconMenu({ size = 14 }) {
+			return h('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.6, strokeLinecap: 'round', 'aria-hidden': true },
+				h('path', { d: 'M2.5 4h11M2.5 8h11M2.5 12h11' }));
+		}
+
+		function IconCheck({ size = 10 }) {
+			return h('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 2.2, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
+				h('path', { d: 'm3 8.5 3.2 3.2L13 5' }));
+		}
+
 		function IconSearch({ size = 13 }) {
 			return h('svg', { width: size, height: size, viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', strokeWidth: 1.5, strokeLinecap: 'round', 'aria-hidden': true },
 				h('circle', { cx: 7, cy: 7, r: 4.2 }),
@@ -508,6 +752,7 @@ window.__ModuleLoader__.load({
 .dsm-search input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--dsw-alias-label-primary);font:inherit;font-size:12.5px}
 .dsm-search input::placeholder{color:var(--dsw-alias-label-secondary)}
 .dsm-zoom{min-width:52px;text-align:center;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;font-size:12px}
+.dsm-body{flex:1 1 auto;display:flex;min-height:0}
 .dsm-canvas{position:relative;flex:1 1 auto;min-height:0;overflow:hidden;cursor:grab;background-color:var(--dsw-alias-bg-base);background-image:radial-gradient(circle,var(--dsw-alias-border-l1) 1px,transparent 1px);background-size:26px 26px;touch-action:none;user-select:none;-webkit-user-select:none}
 .dsm-canvas.dsm-panning{cursor:grabbing}
 .dsm-world{position:absolute;left:0;top:0;transform-origin:0 0}
@@ -517,6 +762,19 @@ window.__ModuleLoader__.load({
 .dsm-edge.dsm-edge-current{stroke:var(--dsw-alias-brand-primary);opacity:.9}
 .dsm-band{position:absolute;border:1px solid var(--dsw-alias-border-l1);border-radius:16px;background:var(--dsw-alias-bg-layer-2);opacity:1;pointer-events:none}
 .dsm-band-label{position:absolute;left:16px;top:9px;font-size:11.5px;font-weight:600;letter-spacing:.03em;text-transform:uppercase;color:var(--dsw-alias-label-secondary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:calc(100% - 32px)}
+.dsm-group{position:absolute;border:1.5px dashed var(--dsw-alias-border-l2);border-radius:14px;background:color-mix(in srgb, var(--dsw-alias-bg-overlay) 45%, transparent);pointer-events:none}
+.dsm-group-head{position:absolute;left:10px;right:8px;top:7px;display:flex;align-items:center;justify-content:space-between;gap:8px;pointer-events:auto}
+.dsm-group-label{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-secondary)}
+.dsm-group-btn{flex:none;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--dsw-alias-border-l1);border-radius:6px;background:var(--dsw-alias-bg-base);color:var(--dsw-alias-label-secondary);cursor:pointer;padding:0}
+.dsm-group-btn:hover{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary)}
+.dsm-group-btn:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
+.dsm-group-block{position:absolute;display:flex;flex-direction:column;justify-content:center;gap:3px;padding:8px 12px;border:1.5px dashed var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1);cursor:pointer;box-sizing:border-box;overflow:hidden}
+.dsm-group-block:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsm-group-block:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
+.dsm-group-block-title{display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:550;color:var(--dsw-alias-label-primary);white-space:nowrap}
+.dsm-group-block-meta{font-size:11px;color:var(--dsw-alias-label-secondary);white-space:nowrap}
+.dsm-group-btn-corner{position:absolute;right:6px;top:6px}
+.dsm-badge.dsm-badge-fold{color:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);cursor:pointer}
 .dsm-node{position:absolute;width:226px;height:66px}
 .dsm-node-hit{display:flex;flex-direction:column;justify-content:center;gap:5px;width:100%;height:100%;padding:8px 14px 8px 13px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1);color:inherit;text-align:left;font:inherit;cursor:pointer;box-sizing:border-box;overflow:hidden}
 .dsm-node-hit:hover{border-color:var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2)}
@@ -575,6 +833,18 @@ window.__ModuleLoader__.load({
 .dsm-empty .dsm-empty-glyph{color:var(--dsw-alias-label-secondary)}
 .dsm-notice{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);z-index:9;padding:6px 12px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-overlay);font-size:12px;color:var(--dsw-alias-label-primary);max-width:70%}
 .dsm-sr{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+.dsm-side{flex:0 0 224px;border-left:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);display:flex;flex-direction:column;min-height:0}
+.dsm-side-head{flex:none;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 12px 10px 14px;border-bottom:1px solid var(--dsw-alias-border-l1)}
+.dsm-side-title{font-size:12.5px;font-weight:600}
+.dsm-side-list{flex:1 1 auto;overflow:auto;padding:8px;display:flex;flex-direction:column;gap:2px}
+.dsm-ws{display:flex;align-items:center;gap:9px;width:100%;padding:7px 8px;border:0;border-radius:8px;background:transparent;color:inherit;font:inherit;font-size:12.5px;text-align:left;cursor:pointer}
+.dsm-ws:hover{background:var(--dsw-alias-bg-layer-2)}
+.dsm-ws:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}
+.dsm-check{flex:none;width:15px;height:15px;border:1.5px solid var(--dsw-alias-border-l2);border-radius:4px;display:inline-flex;align-items:center;justify-content:center;color:var(--dsw-alias-bg-base)}
+.dsm-ws[aria-pressed="true"] .dsm-check{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.dsm-ws-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-ws-count{flex:none;color:var(--dsw-alias-label-secondary);font-size:11px}
+.dsm-side-foot{flex:none;padding:8px 12px;border-top:1px solid var(--dsw-alias-border-l1)}
 `);
 		}
 
@@ -622,14 +892,70 @@ window.__ModuleLoader__.load({
 			const [notice, setNotice] = useState(null);
 			const [fitted, setFitted] = useState(false);
 			const [fitRequest, setFitRequest] = useState(0);
+			// Subagent batch boxes: 0 expanded, 1 one block, 2 folded into the parent.
+			// The page-session cache keeps the choices across tab switches; it is
+			// plain module state, so reloading the page (or reopening the app)
+			// starts fresh at the default collapse.
+			const [groupState, setGroupState] = useState(groupCollapseMemory);
+			// Workspace filter: null means "never touched" — follow the newest
+			// workspace; once the user picks, the explicit set is remembered for
+			// the page session like the batch collapse choices.
+			const [visibleWorkspaces, setVisibleWorkspaces] = useState(workspaceFilterMemory);
+			const [filterOpen, setFilterOpen] = useState(false);
 
 			const canvasRef = useRef(null);
 			const viewRef = useRef(view);
 			const noticeTimer = useRef(null);
 			viewRef.current = view;
 
-			const graph = useMemo(() => buildGraph(sessions, workspaces, showArchived), [sessions, workspaces, showArchived]);
-			const layout = useMemo(() => layoutGraph(graph), [graph]);
+			// The bands the panel can list, newest first.
+			const workspaceEntries = useMemo(() => {
+				const entries = (workspaces.items || []).map((item) => ({
+					id: item.workspaceId,
+					title: item.title || item.path || item.workspaceId,
+					updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : '',
+					count: (item.sessionIds || []).length,
+				}));
+				entries.sort((left, right) => (left.updatedAt < right.updatedAt ? 1 : left.updatedAt > right.updatedAt ? -1 : 0));
+				return entries;
+			}, [workspaces]);
+
+			const defaultVisibleIds = useMemo(() => {
+				const withSessions = workspaceEntries.filter((entry) => entry.count > 0);
+				const newest = withSessions[0] || workspaceEntries[0];
+				return newest === undefined ? null : new Set([newest.id]);
+			}, [workspaceEntries]);
+
+			const visibleIds = visibleWorkspaces === null || visibleWorkspaces === undefined ? defaultVisibleIds : visibleWorkspaces;
+
+			const graph = useMemo(() => buildGraph(sessions, workspaces, showArchived, visibleIds), [sessions, workspaces, showArchived, visibleIds]);
+
+			const normalizedQuery = query.trim().toLowerCase();
+			// Search matches titles within the visible bands only.
+			const matchedIds = useMemo(() => {
+				if (normalizedQuery === '') return null;
+				const set = new Set();
+				for (const group of graph.groups) {
+					for (const node of group.nodes) {
+						if (node.title.toLowerCase().includes(normalizedQuery)) set.add(node.id);
+					}
+				}
+				return set;
+			}, [graph, normalizedQuery]);
+
+			// Searching temporarily expands batches that contain matches, so a
+			// hit inside a collapsed block is actually visible.
+			const effectiveGroupState = useMemo(() => {
+				if (matchedIds === null) return groupState;
+				const next = { ...groupState };
+				for (const subGroup of graph.subagentGroups) {
+					if ((next[subGroup.key] ?? DEFAULT_GROUP_MODE) === 0) continue;
+					if (subGroup.members.some((member) => matchedIds.has(member.id))) next[subGroup.key] = 0;
+				}
+				return next;
+			}, [groupState, matchedIds, graph]);
+
+			const layout = useMemo(() => layoutGraph(graph, effectiveGroupState), [graph, effectiveGroupState]);
 
 			const placed = useMemo(() => {
 				return layout.placed.map((entry) => {
@@ -650,7 +976,7 @@ window.__ModuleLoader__.load({
 
 			// Bounds follow manual node offsets, so "fit" brings dragged nodes back.
 			const worldBounds = useMemo(() => {
-				if (placed.length === 0) return { x: 0, y: 0, width: 0, height: 0 };
+				if (placed.length === 0 && layout.groupBoxes.length === 0) return { x: 0, y: 0, width: 0, height: 0 };
 				let minX = Infinity;
 				let minY = Infinity;
 				let maxX = -Infinity;
@@ -661,12 +987,20 @@ window.__ModuleLoader__.load({
 					maxX = Math.max(maxX, entry.x + NODE_W);
 					maxY = Math.max(maxY, entry.y + NODE_H);
 				}
+				for (const box of layout.groupBoxes) {
+					minX = Math.min(minX, box.x);
+					minY = Math.min(minY, box.y);
+					maxX = Math.max(maxX, box.x + box.width);
+					maxY = Math.max(maxY, box.y + box.height);
+				}
 				return { x: minX, y: minY, width: maxX - minX, height: maxY - minY };
-			}, [placed]);
+			}, [placed, layout]);
 
 			const edges = useMemo(() => {
 				const out = [];
 				for (const entry of placed) {
+					// A grouped subagent's lineage is drawn once, to its group box.
+					if (entry.node.groupKey !== undefined) continue;
 					const parent = entry.node.parentId;
 					if (parent === undefined) continue;
 					const from = placedById.get(parent);
@@ -678,18 +1012,82 @@ window.__ModuleLoader__.load({
 						current: entry.node.current,
 					});
 				}
-				return out;
-			}, [placed, placedById]);
-
-			const normalizedQuery = query.trim().toLowerCase();
-			const matchedIds = useMemo(() => {
-				if (normalizedQuery === '') return null;
-				const set = new Set();
-				for (const node of graph.nodes.values()) {
-					if (node.title.toLowerCase().includes(normalizedQuery)) set.add(node.id);
+				for (const box of layout.groupBoxes) {
+					const from = placedById.get(box.group.parentId);
+					if (from === undefined) continue;
+					const aimY = box.mode === 'expanded' ? box.y + 14 : box.y + NODE_H / 2;
+					out.push({
+						id: `sg-${box.group.key}`,
+						path: edgePath(from.x + NODE_W, from.y + NODE_H / 2, box.x, aimY),
+						subagent: true,
+						current: false,
+					});
 				}
-				return set;
-			}, [graph, normalizedQuery]);
+				return out;
+			}, [placed, placedById, layout]);
+
+			const groupsByParentId = useMemo(() => {
+				const map = new Map();
+				for (const subGroup of graph.subagentGroups) {
+					const list = map.get(subGroup.parentId) || [];
+					list.push(subGroup);
+					map.set(subGroup.parentId, list);
+				}
+				return map;
+			}, [graph]);
+
+			// Parents carry a badge while whole batches are folded into them.
+			const foldedByParent = useMemo(() => {
+				const map = new Map();
+				for (const subGroup of graph.subagentGroups) {
+					if ((effectiveGroupState[subGroup.key] ?? DEFAULT_GROUP_MODE) !== 2) continue;
+					map.set(subGroup.parentId, (map.get(subGroup.parentId) || 0) + subGroup.members.length);
+				}
+				return map;
+			}, [graph, effectiveGroupState]);
+
+			const setGroupMode = useCallback((key, mode) => {
+				setGroupState((previous) => ({ ...previous, [key]: mode }));
+			}, []);
+
+			// Un-folding from the parent badge first shows the one-block state.
+			const expandParentGroups = useCallback((parentId) => {
+				setGroupState((previous) => {
+					const next = { ...previous };
+					for (const subGroup of groupsByParentId.get(parentId) || []) {
+						if (next[subGroup.key] === 2) next[subGroup.key] = 1;
+					}
+					return next;
+				});
+			}, [groupsByParentId]);
+
+			// Keep the page-session memory in sync so switching tabs and back
+			// restores the same collapse choices.
+			useEffect(() => {
+				groupCollapseMemory = groupState;
+			}, [groupState]);
+
+			const toggleWorkspace = useCallback((workspaceId) => {
+				setVisibleWorkspaces((previous) => {
+					const base = previous === null || previous === undefined ? defaultVisibleIds : previous;
+					const next = new Set(base);
+					if (next.has(workspaceId)) next.delete(workspaceId);
+					else next.add(workspaceId);
+					return next;
+				});
+			}, [defaultVisibleIds]);
+
+			const selectAllWorkspaces = useCallback(() => {
+				setVisibleWorkspaces((previous) => {
+					const everySelected = workspaceEntries.length > 0 && workspaceEntries.every((entry) => (previous ?? defaultVisibleIds).has(entry.id));
+					if (everySelected) return new Set(defaultVisibleIds ?? []);
+					return new Set(workspaceEntries.map((entry) => entry.id));
+				});
+			}, [workspaceEntries, defaultVisibleIds]);
+
+			useEffect(() => {
+				workspaceFilterMemory = visibleWorkspaces;
+			}, [visibleWorkspaces]);
 
 			const current = useMemo(() => {
 				for (const node of graph.nodes.values()) if (node.current) return node;
@@ -944,7 +1342,8 @@ window.__ModuleLoader__.load({
 					h('span', { className: 'dsm-time' }, t('menu.heading')),
 					h('button', { type: 'button', className: 'dsm-link', onClick: () => setMenuId(null) }, t('menu.close')))) : null;
 
-			const empty = graph.total === 0 && sessions.phase !== 'pending';
+			const empty = graph.total === 0 && graph.allGroups.length === 0 && sessions.phase !== 'pending';
+			const filteredEmpty = graph.total === 0 && graph.allGroups.length > 0 && sessions.phase !== 'pending';
 			const loading = sessions.phase === 'pending';
 			const statusText = (node) => {
 				const parts = [];
@@ -952,6 +1351,30 @@ window.__ModuleLoader__.load({
 				parts.push(node.running ? t('status.running') : node.leaf ? t('status.leaf') : t('status.normal'));
 				return parts.join(' · ');
 			};
+
+			// The right side panel: pick which workspace bands render. Newest
+			// first; the ungrouped band lists last when it has sessions.
+			const filterEntries = [...workspaceEntries];
+			const ungroupedBand = graph.allGroups.find((group) => group.workspaceId === UNGROUPED);
+			if (ungroupedBand !== undefined) filterEntries.push({ id: UNGROUPED, title: t('workspace.other'), count: ungroupedBand.nodes.length });
+			const filterPanel = filterOpen ? h('aside', { className: 'dsm-side', 'data-dsm-ui': 'filter', 'aria-label': t('filter.title') },
+				h('div', { className: 'dsm-side-head' },
+					h('span', { className: 'dsm-side-title' }, t('filter.title')),
+					h('button', { type: 'button', className: 'dsm-link', onClick: selectAllWorkspaces }, t('filter.selectAll'))),
+				h('div', { className: 'dsm-side-list', role: 'group', 'aria-label': t('filter.title') },
+					...filterEntries.map((entry) => {
+						const on = visibleIds === null || visibleIds.has(entry.id);
+						return h('button', {
+							type: 'button',
+							key: entry.id,
+							className: 'dsm-ws',
+							'aria-pressed': on,
+							onClick: () => toggleWorkspace(entry.id),
+						},
+							h('span', { className: 'dsm-check' }, on ? h(IconCheck) : null),
+							h('span', { className: 'dsm-ws-name' }, entry.title),
+							h('span', { className: 'dsm-ws-count' }, t('filter.count', { n: entry.count })));
+					}))) : null;
 
 			return h('section', { className: 'dsm-page', 'aria-label': t('title') },
 				h(Styles),
@@ -991,8 +1414,17 @@ window.__ModuleLoader__.load({
 						}, h(IconArchive, null), showArchived ? t('toolbar.hideArchived') : t('toolbar.archived')),
 						h('button', { type: 'button', className: 'dsm-btn dsm-primary', onClick: () => newSessionIn(current ? current.workspaceId : undefined) },
 							h(IconPlus, null),
-							t('toolbar.new')))),
-				h('div', {
+							t('toolbar.new')),
+						h('button', {
+							type: 'button',
+							className: 'dsm-btn dsm-icon-only',
+							title: t('filter.toggle'),
+							'aria-label': t('filter.toggle'),
+							'aria-pressed': filterOpen,
+							onClick: () => setFilterOpen((previous) => !previous),
+						}, h(IconMenu, null)))),
+				h('div', { className: 'dsm-body' },
+					h('div', {
 					ref: canvasRef,
 					className: 'dsm-canvas',
 					role: 'region',
@@ -1011,6 +1443,57 @@ window.__ModuleLoader__.load({
 							className: 'dsm-band',
 							style: { left: band.x, top: band.y, width: band.width, height: band.height },
 						}, h('div', { className: 'dsm-band-label' }, band.workspaceId === UNGROUPED ? t('workspace.other') : band.title))),
+						...layout.groupBoxes.map((box) => {
+							const count = box.group.members.length;
+							const when = formatRelative(box.group.startedAt, t);
+							if (box.mode === 'block') {
+								return h('div', {
+									key: box.group.key,
+									className: 'dsm-group-block',
+									style: { left: box.x, top: box.y, width: box.width, height: box.height },
+									'data-dsm-ui': `block-${box.group.key}`,
+									role: 'button',
+									tabIndex: 0,
+									title: t('group.expand'),
+									'aria-label': `${t('group.block', { n: count })} · ${when}`,
+									onPointerDown: (event) => event.stopPropagation(),
+									onClick: () => setGroupMode(box.group.key, 0),
+									onKeyDown: (event) => {
+										if (event.key !== 'Enter' && event.key !== ' ') return;
+										event.preventDefault();
+										setGroupMode(box.group.key, 0);
+									},
+								},
+									h('span', { className: 'dsm-group-block-title' }, h(IconAgents, { size: 13 }), t('group.block', { n: count })),
+									h('span', { className: 'dsm-group-block-meta' }, when),
+									h('button', {
+										type: 'button',
+										className: 'dsm-group-btn dsm-group-btn-corner',
+										title: t('group.fold'),
+										'aria-label': t('group.fold'),
+										onPointerDown: (event) => event.stopPropagation(),
+										onClick: (event) => {
+											event.stopPropagation();
+											setGroupMode(box.group.key, 2);
+										},
+									}, h(IconFold, { size: 11 })));
+							}
+							return h('div', {
+								key: box.group.key,
+								className: 'dsm-group',
+								style: { left: box.x, top: box.y, width: box.width, height: box.height },
+							},
+								h('div', { className: 'dsm-group-head', 'data-dsm-ui': `head-${box.group.key}` },
+									h('span', { className: 'dsm-group-label' }, `${t('group.label', { n: count })} · ${when}`),
+									h('button', {
+										type: 'button',
+										className: 'dsm-group-btn',
+										title: t('group.collapse'),
+										'aria-label': t('group.collapse'),
+										onPointerDown: (event) => event.stopPropagation(),
+										onClick: () => setGroupMode(box.group.key, 1),
+									}, h(IconMinus, { size: 10 }))));
+						}),
 						h('svg', { className: 'dsm-edges', width: 1, height: 1, 'aria-hidden': true },
 							...edges.map((edge) => h('path', {
 								key: edge.id,
@@ -1019,6 +1502,7 @@ window.__ModuleLoader__.load({
 							}))),
 						...placed.map((entry) => {
 							const node = entry.node;
+							const foldedCount = foldedByParent.get(node.id) || 0;
 							const dim = matchedIds !== null && !matchedIds.has(node.id);
 							const classes = ['dsm-node'];
 							if (node.leaf) classes.push('dsm-leaf');
@@ -1058,6 +1542,17 @@ window.__ModuleLoader__.load({
 										node.current ? h('span', { className: 'dsm-badge dsm-badge-current' }, t('node.current')) : null,
 										node.running ? h('span', { className: 'dsm-badge dsm-badge-run' }, t('node.running')) : null,
 										node.archived ? h('span', { className: 'dsm-badge' }, t('node.archived')) : null,
+										foldedCount > 0 ? h('button', {
+											type: 'button',
+											className: 'dsm-badge dsm-badge-fold',
+											title: t('group.expandParent'),
+											'aria-label': t('group.expandParent'),
+											onPointerDown: (event) => event.stopPropagation(),
+											onClick: (event) => {
+												event.stopPropagation();
+												expandParentGroups(node.id);
+											},
+										}, t('group.foldedBadge', { n: foldedCount })) : null,
 										h('span', { className: 'dsm-time' }, formatRelative(node.updatedAt, t)))),
 								node.leaf ? h('span', { className: 'dsm-cap', 'aria-hidden': true }) : null,
 								h('button', {
@@ -1082,7 +1577,10 @@ window.__ModuleLoader__.load({
 						h('p', null, t('empty.body')),
 						h('button', { type: 'button', className: 'dsm-btn dsm-primary', onClick: () => newSessionIn(undefined) }, t('empty.action'))) : null,
 					loading && !empty ? h('div', { className: 'dsm-empty' }, h('p', null, t('map.loading'))) : null,
-					noMatches && !empty ? h('div', { className: 'dsm-empty' }, h('p', null, t('empty.filtered'))) : null,
+					filteredEmpty ? h('div', { className: 'dsm-empty' },
+						h('h2', null, t('filter.title')),
+						h('p', null, t('filter.none'))) : null,
+					noMatches && !empty && !filteredEmpty ? h('div', { className: 'dsm-empty' }, h('p', null, t('empty.filtered'))) : null,
 					placed.length > 0 ? h('div', { className: 'dsm-hint' }, t('canvas.hint')) : null,
 					placed.length > 0 ? h('div', { className: 'dsm-footer' },
 						h('span', { className: 'dsm-chip' }, h('b', null, graph.total), t('footer.sessions')),
@@ -1108,6 +1606,19 @@ window.__ModuleLoader__.load({
 							fill: 'var(--dsw-alias-bg-layer-2)',
 							stroke: 'var(--dsw-alias-border-l1)',
 							strokeWidth: 0.6,
+						})),
+						...layout.groupBoxes.map((box) => h('rect', {
+							key: `mm-${box.group.key}`,
+							x: minimap.offsetX + box.x * minimap.scale,
+							y: minimap.offsetY + box.y * minimap.scale,
+							width: Math.max(2, box.width * minimap.scale),
+							height: Math.max(1.5, box.height * minimap.scale),
+							rx: 1.5,
+							fill: 'none',
+							stroke: 'var(--dsw-alias-label-secondary)',
+							strokeWidth: 0.8,
+							strokeDasharray: '2 1.5',
+							opacity: 0.7,
 						})),
 						...placed.map((entry) => h('rect', {
 							key: `mm-${entry.node.id}`,
@@ -1136,7 +1647,7 @@ window.__ModuleLoader__.load({
 							});
 						})())) : null,
 					notice ? h('div', { className: 'dsm-notice', role: 'status', 'aria-live': 'polite' }, notice) : null,
-					h('span', { className: 'dsm-sr', 'aria-live': 'polite' }, busyId ? t('notice.forking') : '')));
+					h('span', { className: 'dsm-sr', 'aria-live': 'polite' }, busyId ? t('notice.forking') : '')), filterPanel));
 		}
 
 		/** Sidebar entry icon; the sidebar owns the accessible label. */
